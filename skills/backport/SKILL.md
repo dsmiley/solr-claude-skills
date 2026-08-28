@@ -555,7 +555,7 @@ Then:
   git push apache <target>
   ```
 
-**Never push.** That's a human decision.
+D6 itself never pushes. The offer to run the push lives in D7's push gate.
 
 In Triage mode, return to T7 after this to write results back into the state file.
 
@@ -580,10 +580,15 @@ git fetch apache <target> -q
 git rev-list --count apache/<target>..<target>
 ```
 
-- **Non-zero** (commits not pushed): tell the user to run `git push apache <target>` first, then
-  `AskUserQuestion` -- "Backport commits are not yet on `apache/<target>`. JIRA resolution waits
-  until they're pushed." Options: `I've pushed now` / `Skip JIRA for now`. On `I've pushed now`,
-  re-run the check; if still non-zero, report that and skip -- do not open anything.
+- **Non-zero** (commits not pushed): `AskUserQuestion` -- "<N> commit(s) not yet on
+  `apache/<target>`. Push before JIRA resolution?" Options: `Push now` / `Already pushed -- re-check`
+  / `Skip JIRA`.
+  - `Push now`: run `git push apache <target>` (its Bash approval prompt is the user's
+    confirmation). Then re-run the count -- zero continues; a push failure or still-non-zero is
+    reported and D7 stops (open nothing).
+  - `Already pushed -- re-check`: re-run `git fetch apache <target> -q` + the count (covers a push
+    from another terminal). Same zero / non-zero handling.
+  - `Skip JIRA`: stop D7.
 - **Zero** (pushed): continue.
 
 **Approval:** once the push gate passes, `AskUserQuestion` -- "Open <N> JIRA issue(s) in Firefox
