@@ -559,25 +559,56 @@ Then:
 
 In Triage mode, return to T7 after this to write results back into the state file.
 
-### D7. JIRA reminder
+### D7. JIRA resolution
 
-**Direct mode:** there's no milestone/state tracking to check completeness against, so give the
-generic reminder:
+Collect the JIRA keys, then -- after the commits are pushed and the user approves -- open each in
+Firefox for the user to set its **Fix Version** and resolve.
 
-> If these commits fix issues tracked in Apache JIRA, consider opening each issue and setting its
-> **Fix Version** to the next release that will ship from the target branch, then resolving it as
-> **Fixed** -- if it isn't already resolved from when it landed on the source branch.
+**Direct mode:** no milestone/state tracking to check completeness against. Extract the `SOLR-\d+`
+prefix from each cherry-picked commit subject and dedupe -- treat these as candidates (some may
+already be resolved from when they landed on the source branch).
 
-**Triage mode:** use the precise `ready_to_resolve` list T7 just computed instead of a blanket
-reminder. If it's non-empty:
+**Triage mode:** use the precise `ready_to_resolve` list T7 just computed -- issues now fully
+backported across every release line their milestone requires.
 
-> The following JIRA issues are now fully backported across every release line their milestone
-> requires: `<comma-separated keys>`. Consider opening each, confirming the Fix Version(s), and
-> resolving it.
+If the list is non-empty, proceed through the gate and approval below.
 
-If empty, say nothing -- most batches won't complete every required line in one pass (a 9.x
-milestone commit backported only to `branch_10x` this run still needs `branch_9x` before it's
-truly done), so silence here is the normal case, not a sign something's wrong.
+**Push gate -- JIRA resolution must not happen before the commits are on the remote.** Check:
+
+```bash
+git fetch apache <target> -q
+git rev-list --count apache/<target>..<target>
+```
+
+- **Non-zero** (commits not pushed): tell the user to run `git push apache <target>` first, then
+  `AskUserQuestion` -- "Backport commits are not yet on `apache/<target>`. JIRA resolution waits
+  until they're pushed." Options: `I've pushed now` / `Skip JIRA for now`. On `I've pushed now`,
+  re-run the check; if still non-zero, report that and skip -- do not open anything.
+- **Zero** (pushed): continue.
+
+**Approval:** once the push gate passes, `AskUserQuestion` -- "Open <N> JIRA issue(s) in Firefox
+for Fix Version / resolution?" Options: `Open` / `Skip`. For more than 5 keys, list them in the
+question detail. This approval is always required; never open browser tabs without it.
+
+**Open** (on approval): build one `https://issues.apache.org/jira/browse/<KEY>` URL per key and
+open them in a single invocation (multiple URLs -> multiple tabs):
+
+```bash
+open -a Firefox https://issues.apache.org/jira/browse/SOLR-1234 https://issues.apache.org/jira/browse/SOLR-5678
+```
+
+Then print the reminder:
+
+> Opened <N> JIRA issue(s). For each: confirm or add the **Fix Version** for the next release that
+> will ship from `<target>`, then resolve as **Fixed** if it isn't already.
+
+Triage mode prepends: "These are fully backported across every release line their milestone
+requires: `<comma-separated keys>`."
+
+If the list is empty, say nothing -- most batches won't complete every required line in one pass
+(a 9.x milestone commit backported only to `branch_10x` this run still needs `branch_9x` before
+it's truly done), so silence here is the normal case, not a sign something's wrong. In Direct
+mode, empty means no `SOLR-` keys were present in the subjects.
 
 In Direct mode, this is the last step. In Triage mode, this happens once per target after that
 target's Execution pass, before moving on (T7) or to T8-T10.
