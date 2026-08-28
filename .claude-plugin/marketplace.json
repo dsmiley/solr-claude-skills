@@ -1,0 +1,15 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "solr-claude-skills",
+  "owner": {
+    "name": "David Smiley",
+    "url": "https://github.com/dsmiley"
+  },
+  "plugins": [
+    {
+      "name": "solr-dev",
+      "source": "./",
+      "description": "Skills for Apache Solr development: backport, backport-discover, solr-ci-triage, solr-fucit-flaky-tests, branch-commit-msg."
+    }
+  ]
+}

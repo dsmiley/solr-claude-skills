@@ -1,0 +1,15 @@
+{
+  "$schema": "https://anthropic.com/claude-code/plugin.schema.json",
+  "name": "solr-dev",
+  "version": "0.1.0",
+  "description": "Claude Code skills for Apache Solr development: backporting to release branches, CI failure triage, and branch commit messages.",
+  "author": {
+    "name": "David Smiley",
+    "url": "https://github.com/dsmiley"
+  },
+  "homepage": "https://github.com/dsmiley/solr-claude-skills",
+  "repository": "https://github.com/dsmiley/solr-claude-skills",
+  "license": "Apache-2.0",
+  "keywords": ["apache-solr", "solr", "backport", "ci", "jenkins"],
+  "skills": "./skills/"
+}
