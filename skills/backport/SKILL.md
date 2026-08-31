@@ -382,7 +382,14 @@ the file path. The user is tracking multiple commits across a session and needs 
 know which change is being discussed before reading the rest of the question.
 - **LLM resolve** -- Claude attempts the resolution.
 - **Open mergetool** -- user resolves in a separate terminal.
-- **Abort + stop** -- abort this commit and stop the loop (earlier commits stay applied).
+- **Skip (final)** -- this commit doesn't belong on this target -- too large/divergent to
+  responsibly auto-resolve or merge by hand right now (e.g. the conflict stems from the two
+  branches' dependency sets having drifted, not from a mergeable content difference). Abort the
+  cherry-pick, record the outcome as `not-applicable` (state `skip` -- final, won't be
+  re-proposed), and continue the loop with the next commit. Distinct from **Abort + stop**: this
+  only drops the one commit, the run keeps going.
+- **Abort + stop** -- abort this commit and stop the loop entirely (earlier commits stay applied,
+  this and all remaining commits stay `aborted`/`skipped` -- pending, re-proposed next run).
 
 **LLM resolve branch:**
 - For each unmerged file: Read it, parse `<<<<<<<` / `=======` / `>>>>>>>` blocks, decide a
@@ -405,6 +412,10 @@ know which change is being discussed before reading the rest of the question.
   then reply here to continue."
 - Wait for the user to reply, then: `GIT_EDITOR=: git cherry-pick --continue`. Record as
   `resolved-by-mergetool`.
+
+**Skip (final) branch:**
+- `git cherry-pick --abort`. Record this commit as `not-applicable` (state `skip`, per T7).
+  Continue the loop with the next commit -- skip D4a for this commit (no new code landed).
 
 **Abort branch:**
 - `git cherry-pick --abort`. Record this commit as `aborted` and all remaining as `skipped`. Jump
