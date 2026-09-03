@@ -15,6 +15,7 @@ Not affiliated with or endorsed by the Apache Software Foundation.
 | `solr-ci-triage` | Investigate Jenkins build failures on ci-builds.apache.org and check per-test flaky history via the Develocity API. |
 | `solr-fucit-flaky-tests` | Check a test's CI failure/flakiness trend using fucit.org's Jenkins report aggregator (history back to 2017). |
 | `branch-commit-msg` | Summarize the current branch's commits vs. `main` into one commit message, copied to the clipboard. |
+| `write-changelog` | Generate a changelog YAML entry (via the `writeChangelog` / `writeChangelogPr` Gradle tasks) for the current branch or a given PR, customize its title and type, strip the comment block, and git-add it. |
 
 ## Install
 
