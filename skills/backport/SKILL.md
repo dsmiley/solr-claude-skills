@@ -93,8 +93,26 @@ skipped:
 gh pr edit <pr_number> --milestone "<value>"
 ```
 
-For each entry in `ambiguous_no_pr`, same shape. If not skipped, there's no PR to attach a
-milestone to, so write it into the state file instead:
+For each entry in `ambiguous_no_pr` with a `SOLR-XXXXX`-prefixed subject, first check whether the
+underlying JIRA issue already has an established milestone from a *different* commit/PR under the
+same key -- a commit lacking its own PR (a direct push, or a small follow-up fix) doesn't mean the
+JIRA issue itself is milestone-less, only that *this* commit has no PR to read one off of:
+
+```bash
+gh pr list --search "SOLR-XXXXX" --state merged --json number,title,milestone --limit 20
+```
+
+Also check the state file for other subjects sharing the same `SOLR-XXXXX` prefix with a
+`gh.milestone` or `milestone_override` already set. If a milestone turns up either way, use it
+directly (write it via the snippet below, skip the prompt) -- don't ask the user to guess a
+milestone from the commit's own subject text alone (e.g. inferring `10.x` from "since = 10.1"):
+that can contradict the ticket's real, already-established milestone and cause a premature
+"ready to resolve" in T7 for a release line that hasn't actually been backported yet (see
+[[feedback_backport_milestone_audit_before_asking]] for the incident this caused).
+
+Otherwise, same shape as `ambiguous_pr`: `AskUserQuestion` (header "Milestone", options `9.x` /
+`10.x` / `11.x` / "Skip for now"), batching in groups of 4 if there are more than 4 entries. If
+not skipped, there's no PR to attach a milestone to, so write it into the state file instead:
 
 ```bash
 python3 -c "
