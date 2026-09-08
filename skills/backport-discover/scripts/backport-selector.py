@@ -22,13 +22,37 @@ skill itself, right after a cherry-pick actually completes all of a commit's
 required release lines -- not reconstructed retroactively from this state
 file, which can't reliably distinguish "done" from "never tracked".
 
+Chained sourcing: branch_9x is downstream of branch_10x in the real backport
+chain (main -> branch_10x -> branch_9x), so a commit destined for branch_9x
+should be cherry-picked from branch_10x's own (possibly already-adapted)
+copy, not re-derived from main -- main's copy can carry annotations/APIs
+(e.g. a `@Deprecated(since=...)` tag for main's own next-major version) that
+were already corrected once during the main -> branch_10x backport, and
+re-deriving from main risks silently reintroducing what that correction
+fixed. This is hardcoded to the current two-release-line reality
+(CHERRY_PICK_SOURCE_OVERRIDE below); revisit when the branch lineup rolls
+forward. When --target is branch_9x, this also switches the CI-readiness
+gate to branch_10x's own high-water-mark instead of --source's (main's),
+since what's being verified is "has branch_10x's own copy passed CI on the
+10x line", not main's.
+
 Output (stdout): a single JSON object:
-  cherry_pick     : [{sha, date, author, subject}, ...] oldest-first, CI-verified
-  pending_ci      : same shape, but newer than the CI high-water-mark
-  needs_milestone : [{sha, date, author, subject}, ...] still unresolved
-                     (Stage 1's job, not this script's, to resolve)
-  ci_status       : {high_water_mark, jobs: [...]} from ci-status.py
-  target          : the --target this run was scoped to
+  cherry_pick        : [{sha, date, author, subject}, ...] oldest-first,
+                        CI-verified (sha is on the chained branch -- see
+                        above -- when target has one, else on --source)
+  pending_ci         : same shape, but newer than the CI high-water-mark
+  needs_milestone    : [{sha, date, author, subject}, ...] still unresolved
+                        (Stage 1's job, not this script's, to resolve)
+  needs_10x_backport : [{sha, date, author, subject}, ...] milestone requires
+                        branch_9x, but the commit hasn't reached branch_10x
+                        yet -- sha is --source's (main's) copy, since no
+                        branch_10x copy exists to cherry-pick from. Land it
+                        on branch_10x first; only ever populated when
+                        --target is branch_9x.
+  ci_status          : {high_water_mark, jobs: [...]} from ci-status.py,
+                        for whichever branch actually gated cherry_pick
+                        above (branch_10x when chained, else --source)
+  target             : the --target this run was scoped to
 """
 
 import argparse
@@ -36,6 +60,7 @@ import json
 
 from backport_common import (
     TERMINAL_STATUSES,
+    branch_subject_shas,
     branch_subjects,
     ci_high_water_mark,
     debase,
@@ -48,10 +73,16 @@ from backport_common import (
     save_state,
 )
 
+# branch_9x's real cherry-pick source is branch_10x, not main -- see the
+# "Chained sourcing" note in the module docstring. Hardcoded to today's
+# two-release-line reality; add an entry here if a future branch rolls
+# through an equivalent chain.
+CHERRY_PICK_SOURCE_OVERRIDE = {"branch_9x": "branch_10x"}
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--source", default="main", help="Used only for the CI high-water-mark check")
+    parser.add_argument("--source", default="main", help="Used for the CI high-water-mark check and as the cherry-pick source, unless --target chains through an intermediate branch (see CHERRY_PICK_SOURCE_OVERRIDE)")
     parser.add_argument("--target", default="branch_10x")
     parser.add_argument("--state-file", required=True)
     parser.add_argument("--skip-ci-filter", action="store_true", help="Don't hold back commits newer than the CI high-water-mark")
@@ -61,15 +92,23 @@ def main():
     args.target = debase(args.target)
     target_number = parse_branch_number(args.target)
 
-    fetch_remotes([qualify(args.source), qualify(args.target)])
+    chain_branch = CHERRY_PICK_SOURCE_OVERRIDE.get(args.target)
+    ci_source = chain_branch or args.source
+
+    fetch_remotes(
+        [qualify(args.source), qualify(args.target)]
+        + ([qualify(chain_branch)] if chain_branch else [])
+    )
 
     state = load_state(args.state_file)
     target_subjects = branch_subjects(qualify(args.target))
-    high_water_mark, ci_jobs = ci_high_water_mark(args.source, args.skip_ci_filter)
+    chain_subject_shas = branch_subject_shas(qualify(chain_branch)) if chain_branch else None
+    high_water_mark, ci_jobs = ci_high_water_mark(ci_source, args.skip_ci_filter)
 
     cherry_pick = []
     pending_ci = []
     needs_milestone = []
+    needs_10x_backport = []
 
     for subject, entry in state["subjects"].items():
         targets = entry.get("targets", {})
@@ -82,13 +121,13 @@ def main():
         milestone_title = gh_info.get("milestone") or entry.get("milestone_override")
         m_num = milestone_number(milestone_title)
 
-        sha = entry.get("sha_main")
-        if not sha:
+        main_sha = entry.get("sha_main")
+        if not main_sha:
             continue
 
         if m_num is None:
             needs_milestone.append({
-                "sha": sha,
+                "sha": main_sha,
                 "date": entry.get("date"),
                 "author": entry.get("author"),
                 "subject": subject,
@@ -97,6 +136,20 @@ def main():
 
         if m_num > target_number:
             continue  # not required for this target line at all
+
+        if chain_subject_shas is not None:
+            chained_sha = chain_subject_shas.get(subject)
+            if chained_sha is None:
+                needs_10x_backport.append({
+                    "sha": main_sha,
+                    "date": entry.get("date"),
+                    "author": entry.get("author"),
+                    "subject": subject,
+                })
+                continue
+            sha = chained_sha
+        else:
+            sha = main_sha
 
         covered = (
             high_water_mark is None
@@ -118,11 +171,13 @@ def main():
     cherry_pick.sort(key=lambda c: c["date"])
     pending_ci.sort(key=lambda c: c["date"])
     needs_milestone.sort(key=lambda c: c["date"])
+    needs_10x_backport.sort(key=lambda c: c["date"])
 
     print(json.dumps({
         "cherry_pick": cherry_pick,
         "pending_ci": pending_ci,
         "needs_milestone": needs_milestone,
+        "needs_10x_backport": needs_10x_backport,
         "ci_status": {"high_water_mark": high_water_mark, "jobs": ci_jobs},
         "target": args.target,
     }, indent=2))

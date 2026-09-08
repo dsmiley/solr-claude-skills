@@ -115,12 +115,23 @@ python3 ${CLAUDE_PLUGIN_ROOT}/skills/backport-discover/scripts/backport-selector
 ```
 
 Run it again with `--target "branch_9x"` if `--include-9x` was passed. Parse each run's
-JSON: `cherry_pick`, `pending_ci`, `needs_milestone`, `ci_status`, `target`.
+JSON: `cherry_pick`, `pending_ci`, `needs_milestone`, `needs_10x_backport`, `ci_status`, `target`.
+
+`backport-selector.py` chains branch_9x through branch_10x: a commit destined for branch_9x is
+cherry-picked from branch_10x's own copy (not re-derived from main), since that copy may already
+carry corrections made during the main -> branch_10x backport (e.g. a `@Deprecated(since=...)`
+tag fixed from main's next-major version to 10x's next point release). See the "Chained sourcing"
+note in `backport-selector.py`'s own docstring for the full rationale. This means a branch_9x
+commit not yet on branch_10x can't be sourced at all yet -- `needs_10x_backport` holds those (see
+step 6b).
 
 ### 6. CI status summary
 
-Render `ci_status.jobs` as a table (from either Stage 2 run -- `ci_status` reflects `--source`,
-not `--target`, so it's the same both times):
+Render `ci_status.jobs` as a table. For the `branch_10x` run this reflects `--source` (main). For
+the `branch_9x` run (when `--include-9x`) it instead reflects **branch_10x's own CI**
+(Solr-Test-10.x etc.), per the chained-sourcing note above -- the two Stage 2 runs are no longer
+necessarily identical, so render each target's `ci_status` separately rather than assuming they
+match:
 
 ```
 JOB                         LATEST STATUS   FRONTIER (last green)
@@ -133,6 +144,12 @@ docker-nightly              success         bfd7ff1a  2026-07-09T03:06Z
 Only show the `(build: ...)` link when `latest_status` isn't a pass. State the overall
 `high_water_mark` sha plainly: "CI high-water-mark: `<sha>` -- commits after this are
 held back in Pending CI below."
+
+### 6b. Needs-10x-backport list (branch_9x only, when --include-9x)
+
+Same table shape as step 7, labeled "Needs branch_10x backport first -- not proposed for
+branch_9x until landed there." Informational only: these need a separate `/backport-discover` (or
+`/backport`) pass against `branch_10x` before they'll appear as branch_9x candidates.
 
 ### 7. Cherry-pick list (report only -- no execution)
 

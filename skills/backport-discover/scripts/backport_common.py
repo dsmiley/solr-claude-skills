@@ -73,6 +73,21 @@ def branch_subjects(branch):
     return set(line for line in git("log", "--format=%s", branch).split("\n") if line)
 
 
+def branch_subject_shas(branch):
+    """subject -> sha for every commit on branch. Like branch_subjects(), but
+    keeps the sha so a caller can cherry-pick the branch's own copy of a
+    commit (e.g. branch_10x's already-adapted version) instead of assuming
+    the original source-branch sha applies unchanged."""
+    result = {}
+    # Split on a literal "\t"/"\n" per branch_subjects()'s reasoning above.
+    for line in git("log", "--format=%H\t%s", branch).split("\n"):
+        if not line:
+            continue
+        sha, _, subject = line.partition("\t")
+        result[subject] = sha
+    return result
+
+
 def source_commits(source, since):
     args = ["log", "--reverse", f"--since={since}", "--format=%H\t%an\t%aI\t%cn\t%ce\t%s", source]
     out = git(*args)
