@@ -503,6 +503,22 @@ compile check to confirm the fix before continuing to the next commit. Fixing im
 commit at a time, keeps the trace step unambiguous (the fixup target is always "the commit just
 applied," never a guess across a growing pile of changes).
 
+### D4b. Precommit validation (always, after all commits applied)
+
+Once the cherry-pick loop (D4/D4a) has finished applying every commit -- unconditionally, before
+D5 decides whether to run tests:
+
+```bash
+./gradlew precommit -Pvalidation.errorprone=true
+```
+
+On failure: rule out a pre-existing failure first, using the same worktree-against-
+`apache/<target>` check as Phase A's "Pre-existing failures" guidance below (errorprone/precommit
+can already be failing on the target branch independent of this backport). If it's new, trace
+which cherry-picked commit introduced it (same technique as Phase A) and squash the fix into that
+commit via `--fixup` + autosquash (same commands as Phase A). Re-run to confirm before continuing
+to D5.
+
 ### D5. Tests (auto policy + two-phase runner)
 
 Decide whether to run tests:
