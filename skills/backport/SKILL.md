@@ -35,6 +35,10 @@ Repo root is assumed to be the current working directory and to be the Solr chec
   auto-scopes to your own git `user.email`. Ignored if `--committer` is also given.
 - `--since <duration>` (default `1 month ago`)
 - `--refresh` (force re-fetch of cached GitHub metadata instead of using the cache)
+- `--ignore-ci-jobs <names>` (optional, comma-separated CI job names as shown in T6, e.g.
+  `docker-nightly`). Excludes them from the CI high-water-mark for this run only -- for the
+  occasional known-broken job unrelated to the backports. There is deliberately no persistent
+  default; ignoring a job is an exception, so state it out loud in T6 each time.
 
 ### T1b. Determine target branch
 
@@ -77,13 +81,34 @@ python3 ${CLAUDE_PLUGIN_ROOT}/skills/backport-discover/scripts/backport-discover
   [--refresh]
 ```
 
-Parse the JSON it prints: `ambiguous_pr`, `ambiguous_no_pr`, `committer_filter`. This also
-refreshes GitHub PR metadata in the state file for every pending commit, not just ones matching
-the committer scope.
+Parse the JSON it prints: `milestone_changes`, `reopened_skips`, `overdue_no_milestone`,
+`ambiguous_pr`, `ambiguous_no_pr`, `committer_filter`. This also refreshes GitHub PR metadata in
+the state file for every pending commit, not just ones matching the committer scope, and sweeps
+every GitHub PR updated since the last run so a milestone edited on *any* cached PR -- however old
+-- is picked up (the first run after a long gap can report many changes at once).
+
+### T3b. Report milestone changes and reopened skips
+
+If `milestone_changes` is non-empty, render `subject`, `old -> new` (`none` for null). These are
+informational: the selector in T5 already reflects the new milestones. A change from `9.x` to
+`10.x` means branch_9x is no longer required; `10.x` -> `9.x` or `none`/`11.x` -> `10.x` means a
+commit now needs backporting that previously didn't.
+
+If `reopened_skips` is non-empty, render `subject`, `target`, `reason`, `decided_under -> now`, and
+say: "These were skipped under a different milestone; they're proposed again in T7 unless skipped
+again." No prompt needed here.
 
 ### T4. Resolve ambiguous milestones
 
 Tell the user the committer scope in effect (`committer_filter`, or "everyone" if null).
+
+First, `overdue_no_milestone` (independent of the committer scope -- it covers everyone, so the
+process doesn't depend on any one committer noticing): pending commits older than 5 days that
+still have no milestone. Each is reported once (the script flags it in the state file), so render
+the table now -- DATE / AUTHOR / SUBJECT / PR -- and say these are a one-time heads-up that someone
+may have forgotten to set a milestone (it isn't repeated next run; they stay in T9's residual
+list). Then `AskUserQuestion` (header "Overdue", options "Set milestones now" / "Leave for now"). On
+"Set milestones now", run the per-entry prompts described below for these entries too.
 
 For each entry in `ambiguous_pr`, `AskUserQuestion` (header "Milestone", options `9.x` / `10.x` /
 `11.x` / "Skip for now"), batching in groups of 4 if there are more than 4 entries. If not
@@ -136,11 +161,12 @@ with open(path, 'w') as f:
 ```bash
 python3 ${CLAUDE_PLUGIN_ROOT}/skills/backport-discover/scripts/backport-selector.py \
   --target "<target>" \
-  --state-file ~/.claude/solr-backport-state.json
+  --state-file ~/.claude/solr-backport-state.json \
+  [--ignore-ci-jobs "<names>"]
 ```
 
 Run once per target in the T1b `targets` list. Parse each run's JSON: `cherry_pick`,
-`pending_ci`, `needs_milestone`, `needs_10x_backport`, `ci_status`, `target`.
+`pending_ci`, `needs_milestone`, `needs_10x_backport`, `blocked`, `ci_status`, `target`.
 
 `backport-selector.py` chains branch_9x through branch_10x: a commit destined for branch_9x is
 cherry-picked from branch_10x's own copy (not re-derived from main), since that copy may already
@@ -162,11 +188,13 @@ JOB                         LATEST STATUS   FRONTIER (last green)
 Solr-Lint-main              SUCCESS         595f760b  2026-07-09T00:14Z
 Solr-Test-main              SUCCESS         595f760b  2026-07-09T00:14Z
 Solr-TestIntegration-main   FAILURE         b8af94ab  2026-07-08T03:18Z  (build: <latest_build_url>)
-docker-nightly              success         bfd7ff1a  2026-07-09T03:06Z
+docker-nightly              failure         (ignored -- excluded from the high-water-mark)
 ```
 
-Only show the `(build: ...)` link when `latest_status` isn't a pass. State the `high_water_mark`
-plainly: "CI high-water-mark: `<sha>` -- commits after this are held back in Pending CI below."
+Only show the `(build: ...)` link when `latest_status` isn't a pass. A job with `ignored: true`
+(from `--ignore-ci-jobs`) shows its status but is labeled ignored instead of a frontier. State the
+`high_water_mark` plainly: "CI high-water-mark: `<sha>` -- commits after this are held back in
+Pending CI below." When any job was ignored, name it in that sentence so the exception is visible.
 
 ### T6b. Needs-10x-backport list (branch_9x target only)
 
@@ -175,6 +203,12 @@ branch_9x until landed there." Informational only, no `AskUserQuestion`: these c
 separate `/backport` run against `branch_10x` (from a `main`/`branch_10x` checkout) before they'll
 appear as branch_9x candidates. Empty for `branch_10x` target runs (chaining only applies to
 branch_9x).
+
+### T6c. Blocked list
+
+If `blocked` is non-empty, same table shape as T7 plus `reason` and `blocked_by`, labeled "Deferred
+until a prerequisite lands -- proposed automatically once every `blocked_by` subject is on the
+target." Informational only, no `AskUserQuestion`.
 
 ### T7. Cherry-pick selection and execution
 
@@ -199,8 +233,12 @@ back into the state file:
 
 - `clean`, `resolved-by-llm`, `resolved-by-mergetool` -> status `backported`
 - `already-applied` -> status `ported-different-subject`
-- `not-applicable` -> status `skip` (final -- won't be re-proposed; milestone already adjusted
-  inline in D4 if that option was chosen)
+- `not-applicable` -> status `skip`, `kind: permanent`, with the one-line `reason` from D4 and
+  `milestone_at_decision` (the milestone as it stands now, after any inline change in D4). It's
+  final only while that milestone is unchanged: the discover sweep reopens it if the PR's
+  milestone later changes.
+- `deferred` (D4's "backport prerequisite first" declined, or blocked) -> status `deferred` with
+  `reason` and `blocked_by` (the prerequisite commits' subjects)
 - `aborted`, `skipped` -> no change (stays pending, re-proposed next run) -- this is the Abort
   branch's cascade (user declined to resolve a real conflict and stopped the loop), distinct from
   `not-applicable`'s deliberate, final determination that the commit doesn't belong on this target
@@ -221,12 +259,17 @@ KNOWN_LINES = {"branch_9x": 9, "branch_10x": 10}
 DONE_STATUSES = {"backported", "ported-different-subject"}
 branch = "<target>"
 now = "<current UTC ISO timestamp>"
-updates = {"<subject1>": "<status1>", "<subject2>": "<status2>"}  # this batch only
+# this batch only; each value is the full per-target entry, e.g.
+#   {"status": "backported"}
+#   {"status": "skip", "kind": "permanent", "reason": "...", "milestone_at_decision": "10.x", "decided_at": now}
+#   {"status": "deferred", "reason": "...", "blocked_by": ["<subject>"]}
+updates = {"<subject1>": {"status": "backported"}, "<subject2>": {"status": "backported"}}
 
 ready_to_resolve = []
-for subject, status in updates.items():
+for subject, target_entry in updates.items():
+    status = target_entry["status"]
     entry = state["subjects"][subject]
-    entry.setdefault("targets", {})[branch] = {"status": status}
+    entry.setdefault("targets", {})[branch] = target_entry
     entry["updated_at"] = now
 
     m = re.match(r"^(SOLR-\d+)", subject)
@@ -263,17 +306,19 @@ yet actionable." Informational only, no `AskUserQuestion`.
 
 ### T9. Needs-milestone list (residual)
 
-Anything still in `needs_milestone` after T4 was deferred ("Skip for now") or outside this run's
-committer scope. Render: date, author, subject. Mention rerunning with `--all-committers` to
-widen scope.
+Anything still in `needs_milestone` after T4 was deferred ("Skip for now"), left alone at T4's
+overdue prompt, or outside this run's committer scope. Render: date, author, subject. Mention
+rerunning with `--all-committers` to widen scope.
 
 ### T10. Manual overrides (escape hatch)
 
 Ask: "Any commits need a manual status override -- already ported under a different subject,
 skip, or defer?" If yes, `AskUserQuestion` multiSelect over all commits seen this run (cherry-pick
 + pending-ci + needs-milestone combined), then for each selected commit ask target branch(es) and
-status (`ported-different-subject` / `skip` / `deferred`), optional free-text note. Write via the
-same inline `python3 -c` pattern as T7.
+status (`ported-different-subject` / `skip` / `deferred`) and a one-line reason (required for `skip`
+and `deferred`; for `skip`, also ask permanent vs deferred, and record `milestone_at_decision`;
+for `deferred`, optionally `blocked_by`). Write via the same inline `python3 -c` pattern as T7,
+using the per-target entry shapes shown there.
 
 ---
 
@@ -309,6 +354,14 @@ deduplication is performed -- trust the user to know what they're backporting.
 ## Execution (used by both modes)
 
 ### D3. Checkout the target branch
+
+If the working tree is dirty (`git status --short` non-empty), stash it first -- including
+untracked files -- so the checkout and cherry-picks start from a clean tree, and tell the user
+the stash exists and how to get back to it (see D6):
+
+```bash
+git stash push -u -m "backport-session-wip"
+```
 
 ```bash
 git checkout <target>
@@ -370,7 +423,9 @@ If none, treat as a hard failure: stop the skill with the error output.
    commit's real change to that file is irrelevant on the target (file/module never existed
    there), resolve by restoring the HEAD-side file byte-identical
    (`git checkout apache/<target> -- <path>`) or `git rm` the orphaned incoming file --
-   don't merge the mismatched contents.
+   don't merge the mismatched contents. But if the commit's change to that file *matters* (it
+   modifies a file the target simply doesn't have yet), that's check 3's prerequisite signal, not a
+   rename accident: find who added the file (below) before deciding.
 
 3. **Feature/API absent from target.** Sometimes a conflict isn't really conflicting content to
    merge -- it's evidence that the code/feature this commit's real change touches was introduced
@@ -383,13 +438,29 @@ If none, treat as a hard failure: stop the skill with the error output.
    `milestone_override` in Triage mode, or `gh pr view <pr_number> --json milestone` otherwise); a
    milestone that requires this line despite the feature being absent is itself probably wrong.
 
+   **Find the prerequisite.** Before offering to skip, identify which earlier main commit
+   introduced what's missing: for a missing file, `git log apache/main --diff-filter=A --format='%h %s'
+   -- <path>`; for a missing symbol, `git log apache/main -S'<symbol>' --format='%h %s' -- <dir>`.
+   Then check whether that commit is on the target by subject, and what its own state and
+   milestone are (`~/.claude/solr-backport-state.json`, or `gh pr view`). A prerequisite with no
+   milestone, or one previously skipped, is the usual reason a whole chain silently never got
+   backported -- say so. When the prerequisite is a sensible backport, its milestone (set it now
+   if missing) means "backport it too".
+
    `AskUserQuestion` (header "Not applicable", naming the commit/subject per above, and explaining
-   what's missing and why) with:
-   - **Skip (defer)** -- this commit doesn't apply here; record it as final for this target
-     (outcome `not-applicable`, written as state `skip` -- won't be re-proposed) and leave the
-     milestone as-is. Use this when the milestone is fine as it stands, or you're not confident
-     enough to change it.
-   - **Skip (change milestone)** -- same final recording, plus fix the milestone right now:
+   what's missing, which commit introduced it, and why) with:
+   - **Backport prerequisite first** (offer when a prerequisite was found) -- `git cherry-pick
+     --abort`, cherry-pick the prerequisite (and anything it needs, recursively, oldest first)
+     ahead of this commit, then retry this commit. Record each as its own outcome as usual.
+   - **Skip (defer)** -- not now; record outcome `deferred` (state `deferred`, with the one-line
+     `reason` and, when a prerequisite was found, `blocked_by: [<prerequisite subject>]` so it
+     comes back automatically once that lands). Use when the milestone is fine as it stands, or
+     you're not confident enough to change it.
+   - **Skip (permanent)** -- this commit doesn't belong on this target; record outcome
+     `not-applicable` (state `skip`, `kind: permanent`) with a one-line `reason` and
+     `milestone_at_decision`. It holds only until the PR's milestone changes; the discover sweep
+     reopens it then.
+   - **Skip (change milestone)** -- same as permanent, plus fix the milestone right now:
      extract the PR number from the subject's trailing `(#NNNN)` (or
      `gh pr list --search <sha> --state merged --json number` if absent), `AskUserQuestion` for
      the corrected value if it isn't obvious (header "Milestone", options `9.x` / `10.x` /
@@ -401,9 +472,10 @@ If none, treat as a hard failure: stop the skill with the error output.
      wrong; fall through to the standard conflict-resolution flow below.
    - *(fallback, not primary)* **Abort + stop** -- same as the standard abort branch.
 
-   Either skip option continues the loop with the next commit -- unlike the Abort branch, this
-   does not stop the run. Record this commit's outcome as `not-applicable` for D6's summary and
-   T7's write-back, not `aborted`/`skipped` (those mean something different -- see T7).
+   Any skip option continues the loop with the next commit -- unlike the Abort branch, this
+   does not stop the run. Record this commit's outcome as `not-applicable` or `deferred` for D6's
+   summary and T7's write-back, not `aborted`/`skipped` (those mean something different -- see
+   T7). Never record a skip without its `reason`.
 
 Split the conflicted files into lockfiles (`*.lockfile`, e.g. `gradle.lockfile`) and everything
 else. Lockfile conflicts are never resolved by merging their markers -- always resolve them by
@@ -421,9 +493,9 @@ know which change is being discussed before reading the rest of the question.
 - **Skip (final)** -- this commit doesn't belong on this target -- too large/divergent to
   responsibly auto-resolve or merge by hand right now (e.g. the conflict stems from the two
   branches' dependency sets having drifted, not from a mergeable content difference). Abort the
-  cherry-pick, record the outcome as `not-applicable` (state `skip` -- final, won't be
-  re-proposed), and continue the loop with the next commit. Distinct from **Abort + stop**: this
-  only drops the one commit, the run keeps going.
+  cherry-pick, record the outcome as `not-applicable` (state `skip`, `kind: permanent`, with a
+  one-line `reason` and `milestone_at_decision`), and continue the loop with the next commit.
+  Distinct from **Abort + stop**: this only drops the one commit, the run keeps going.
 - **Abort + stop** -- abort this commit and stop the loop entirely (earlier commits stay applied,
   this and all remaining commits stay `aborted`/`skipped` -- pending, re-proposed next run).
 
@@ -431,6 +503,14 @@ know which change is being discussed before reading the rest of the question.
 - For each unmerged file: Read it, parse `<<<<<<<` / `=======` / `>>>>>>>` blocks, decide a
   resolution by understanding the intent of both sides in context, Edit the file to remove
   markers and apply the chosen content.
+- Unless every conflict is trivial (import-block-only), do a short dependency analysis first: for
+  each conflicted file, would the incoming change compile and behave on the target without an
+  earlier commit's work? Look for what the incoming hunks reference that the target lacks, and if
+  something's missing, run check 3's "find the prerequisite" step rather than papering over it (a
+  hand-adapted resolution that quietly re-creates a missing feature's shape is the failure mode).
+  When the conflict exists only because of a main-only structural change (e.g. main removed a
+  code path the target still has), adapt the change to the target's structure and say so in the
+  "Apply this resolution?" question.
 - After all files are resolved (or if Claude judges any conflict too risky), show a unified diff:
   ```bash
   git diff
@@ -450,7 +530,8 @@ know which change is being discussed before reading the rest of the question.
   `resolved-by-mergetool`.
 
 **Skip (final) branch:**
-- `git cherry-pick --abort`. Record this commit as `not-applicable` (state `skip`, per T7).
+- `git cherry-pick --abort`. Record this commit as `not-applicable` (state `skip`, `kind:
+  permanent`, with `reason` and `milestone_at_decision`, per T7).
   Continue the loop with the next commit -- skip D4a for this commit (no new code landed).
 
 **Abort branch:**
@@ -571,10 +652,17 @@ completes instead.
 
 **Phase B -- tests (crave):**
 ```bash
-crave run -- ./gradlew --console=plain test
+crave run -- ./gradlew --console=plain test --continue
 ```
-If `crave` isn't on `$PATH`, print a one-line hint and fall back to asking the user how to
-proceed.
+`--continue` matters: without it Gradle stops at the first module with a failing test (usually
+`:solr:core`), so the remaining modules never run and a flake there costs a whole second run just
+to find out about the others. If `crave` isn't on `$PATH`, print a one-line hint and fall back to
+asking the user how to proceed.
+
+Integration tests (the BATS suite in `solr/packaging`, what the `Solr-TestIntegration-*` Jenkins
+job runs) are a separate Gradle task, `./gradlew integrationTests` (~15 min locally). Run it when
+the backported commits touch the CLI, `bin/solr` scripts, or packaging, or when asked; it isn't
+part of `test`. Abbreviations like `itest` aren't valid Gradle task names.
 
 Crave mechanics: the build runs *remotely* -- the local CLI is just a launcher/follower, and
 the remote job keeps running even if the local command is backgrounded or killed. Get the job
@@ -609,7 +697,8 @@ cafebabe  Update build deps                       skipped
 Then:
 - Target branch (with new local HEAD).
 - Tests: `not run` / `passed (local+crave)` / `failed (phase A: local)` / `failed (phase B: crave)`.
-- Original branch the user was on before the skill ran, and the command to return:
+- Original branch the user was on before the skill ran, and the command to return (if D3
+  stashed a dirty tree, include `git stash pop` after it):
   ```bash
   git checkout <original-branch>
   ```

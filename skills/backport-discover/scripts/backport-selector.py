@@ -10,7 +10,8 @@ Purely mechanical: no GitHub API calls, no committer filtering, no
 interactivity, and no git-log walk of the source branch -- it only reads what
 Stage 1 already wrote into the state file, checks the current tip of
 --target, and gates on CI freshness (ci-status.py's high-water-mark for
---source, unless --skip-ci-filter is passed).
+--source, unless --skip-ci-filter is passed; --ignore-ci-jobs excludes named
+jobs from that mark, for the occasional known-broken unrelated job).
 
 Milestone convention: a milestone of N.x requires the commit reach every
 release line numbered N or higher (branch_9x's history passes through
@@ -49,6 +50,9 @@ Output (stdout): a single JSON object:
                         branch_10x copy exists to cherry-pick from. Land it
                         on branch_10x first; only ever populated when
                         --target is branch_9x.
+  blocked            : [{sha, date, author, subject, reason, blocked_by}, ...]
+                        deferred with blocked_by subjects that aren't on --target
+                        yet; offered again automatically once they land
   ci_status          : {high_water_mark, jobs: [...]} from ci-status.py,
                         for whichever branch actually gated cherry_pick
                         above (branch_10x when chained, else --source)
@@ -59,13 +63,14 @@ import argparse
 import json
 
 from backport_common import (
-    TERMINAL_STATUSES,
+    DONE_STATUSES,
     branch_subject_shas,
     branch_subjects,
     ci_high_water_mark,
     debase,
     fetch_remotes,
     is_ancestor,
+    is_terminal,
     load_state,
     milestone_number,
     parse_branch_number,
@@ -86,6 +91,10 @@ def main():
     parser.add_argument("--target", default="branch_10x")
     parser.add_argument("--state-file", required=True)
     parser.add_argument("--skip-ci-filter", action="store_true", help="Don't hold back commits newer than the CI high-water-mark")
+    parser.add_argument(
+        "--ignore-ci-jobs", default="",
+        help="Comma-separated CI job names (see ci-status.py --ignore-jobs) that don't count toward the high-water-mark",
+    )
     args = parser.parse_args()
 
     args.source = debase(args.source)
@@ -103,16 +112,17 @@ def main():
     state = load_state(args.state_file)
     target_subjects = branch_subjects(qualify(args.target))
     chain_subject_shas = branch_subject_shas(qualify(chain_branch)) if chain_branch else None
-    high_water_mark, ci_jobs = ci_high_water_mark(ci_source, args.skip_ci_filter)
+    high_water_mark, ci_jobs = ci_high_water_mark(ci_source, args.skip_ci_filter, [j for j in args.ignore_ci_jobs.split(",") if j])
 
     cherry_pick = []
     pending_ci = []
     needs_milestone = []
     needs_10x_backport = []
+    blocked = []
 
     for subject, entry in state["subjects"].items():
         targets = entry.get("targets", {})
-        if targets.get(args.target, {}).get("status") in TERMINAL_STATUSES:
+        if is_terminal(targets.get(args.target), entry):
             continue
         if subject in target_subjects:
             continue
@@ -136,6 +146,22 @@ def main():
 
         if m_num > target_number:
             continue  # not required for this target line at all
+
+        unmet = [
+            b for b in (targets.get(args.target) or {}).get("blocked_by", [])
+            if b not in target_subjects
+            and state["subjects"].get(b, {}).get("targets", {}).get(args.target, {}).get("status") not in DONE_STATUSES
+        ]
+        if unmet:
+            blocked.append({
+                "sha": main_sha,
+                "date": entry.get("date"),
+                "author": entry.get("author"),
+                "subject": subject,
+                "reason": targets[args.target].get("reason"),
+                "blocked_by": unmet,
+            })
+            continue
 
         if chain_subject_shas is not None:
             chained_sha = chain_subject_shas.get(subject)
@@ -172,12 +198,14 @@ def main():
     pending_ci.sort(key=lambda c: c["date"])
     needs_milestone.sort(key=lambda c: c["date"])
     needs_10x_backport.sort(key=lambda c: c["date"])
+    blocked.sort(key=lambda c: c["date"])
 
     print(json.dumps({
         "cherry_pick": cherry_pick,
         "pending_ci": pending_ci,
         "needs_milestone": needs_milestone,
         "needs_10x_backport": needs_10x_backport,
+        "blocked": blocked,
         "ci_status": {"high_water_mark": high_water_mark, "jobs": ci_jobs},
         "target": args.target,
     }, indent=2))

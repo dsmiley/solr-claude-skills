@@ -2,6 +2,20 @@
 Shared helpers for the backport-discover.py (Stage 1: discovery + milestone
 resolution) and backport-selector.py (Stage 2: backportable-set selection)
 scripts.
+
+State file shape (JSON):
+  meta.sweep_checkpoint : ISO timestamp; GitHub PR updates before it have
+                          already been applied to the cache (see sweep_pr_milestones)
+  subjects[<main commit subject>] :
+    gh      : {pr_number, milestone, labels, merged_by, committer_login, fetched_at}
+    milestone_override : milestone for a PR-less commit
+    targets[<branch>]  : {status, ...} where status is one of
+      backported | ported-different-subject   final
+      skip     : {kind: permanent|deferred, reason, milestone_at_decision, decided_at}
+                 permanent is final only while the milestone still equals
+                 milestone_at_decision; a milestone change reopens it
+      deferred : {reason, blocked_by: [subject, ...]?}; always re-proposed, held
+                 back (not offered) while any blocked_by subject isn't on the target
 """
 
 import json
@@ -13,9 +27,10 @@ from pathlib import Path
 
 REPO = "apache/solr"
 REPO_OWNER, REPO_NAME = REPO.split("/")
-TERMINAL_STATUSES = {"skip", "backported", "ported-different-subject"}
+DONE_STATUSES = {"backported", "ported-different-subject"}
 PRUNE_AFTER_DAYS = 120
 GH_GRAPHQL_BATCH_SIZE = 50
+SWEEP_OVERLAP = timedelta(minutes=5)
 
 # The git remote name for the upstream Solr repo. Branch identifiers are bare
 # (e.g. "branch_10x") everywhere outside this module -- CLI args, state-file
@@ -138,6 +153,48 @@ def milestone_number(milestone_title):
     return int(m.group(1)) if m else None
 
 
+def entry_milestone(entry):
+    return (entry.get("gh") or {}).get("milestone") or entry.get("milestone_override")
+
+
+def is_terminal(target_entry, entry):
+    """Whether a commit's per-target state means "don't propose it again".
+    target_entry is entry["targets"][branch] (or None). A permanent skip only
+    holds while the milestone is still the one it was decided under; anything
+    else (deferred, or a skip with no kind) is re-proposed."""
+    status = (target_entry or {}).get("status")
+    if status in DONE_STATUSES:
+        return True
+    if status == "skip":
+        return (
+            target_entry.get("kind") == "permanent"
+            and target_entry.get("milestone_at_decision") == entry_milestone(entry)
+        )
+    return False
+
+
+def reopened_skips(state, target_branches):
+    """Permanent skips whose milestone has changed since the decision, and whose
+    new milestone still requires that branch: [{subject, target, reason,
+    decided_under, now}]."""
+    reopened = []
+    for subject, entry in state["subjects"].items():
+        for branch in target_branches:
+            t = (entry.get("targets") or {}).get(branch) or {}
+            if t.get("status") != "skip" or t.get("kind") != "permanent" or is_terminal(t, entry):
+                continue
+            now_num = milestone_number(entry_milestone(entry))
+            if now_num is not None and now_num <= parse_branch_number(branch):
+                reopened.append({
+                    "subject": subject,
+                    "target": branch,
+                    "reason": t.get("reason"),
+                    "decided_under": t.get("milestone_at_decision"),
+                    "now": entry_milestone(entry),
+                })
+    return reopened
+
+
 def gh_graphql_fetch(shas):
     """Fetch PR number/milestone/merged_by/labels/committer_login for many commits
     in one round trip per batch, via GraphQL aliases (Commit.associatedPullRequests,
@@ -198,38 +255,78 @@ def gh_graphql_fetch(shas):
     return results
 
 
-def recently_updated_milestone_prs(limit=15):
-    """Cheap staleness probe: for each known release milestone (9.x/10.x/11.x),
-    fetch the `limit` most-recently-updated PRs carrying that milestone right now.
-    Returns {pr_number: milestone_title}.
+def parse_ts(iso):
+    return datetime.fromisoformat(iso.replace("Z", "+00:00"))
 
-    Comparing this against a commit's cached gh.milestone lets discovery catch a
-    PR whose milestone changed *after* it was last fetched (in either direction --
-    moved onto a line, or off of one) without re-fetching every already-resolved
-    commit's metadata on every run. Only catches drift among recently-touched PRs;
-    a milestone edit on a PR nobody has touched since falls outside the window and
-    still needs --refresh to catch."""
-    recent = {}
-    for title in ("9.x", "10.x", "11.x"):
-        result = subprocess.run(
-            [
-                "gh", "pr", "list", "--repo", REPO, "--state", "all",
-                "--search", f"milestone:{title} sort:updated-desc",
-                "--limit", str(limit), "--json", "number,milestone",
-            ],
-            capture_output=True, text=True,
-        )
-        if result.returncode != 0:
-            print(f"Warning: milestone-drift probe failed for {title}:\n{result.stderr.strip()}", file=sys.stderr)
+
+def gh_ts(dt):
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def fetch_updated_prs(since):
+    """{pr_number: {"milestone": title or None, "updated_at": iso}} for every PR
+    updated since the datetime `since`, via the issues listing (which includes PRs and
+    carries each item's current milestone). Returns None if the call fails, so
+    the caller doesn't advance its checkpoint past updates it never saw."""
+    result = subprocess.run(
+        [
+            "gh", "api", "--paginate",
+            f"repos/{REPO}/issues?state=all&since={gh_ts(since)}&sort=updated&direction=asc&per_page=100",
+            "--jq", r'.[] | select(.pull_request) | [.number, (.milestone.title // ""), .updated_at] | @tsv',
+        ],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        print(f"Warning: PR update sweep failed:\n{result.stderr.strip()}", file=sys.stderr)
+        return None
+    prs = {}
+    for line in result.stdout.split("\n"):
+        if not line:
             continue
-        try:
-            prs = json.loads(result.stdout)
-        except json.JSONDecodeError:
-            continue
-        for pr in prs:
-            milestone = pr.get("milestone") or {}
-            recent[pr["number"]] = milestone.get("title")
-    return recent
+        number, milestone, updated_at = line.split("\t")
+        prs[int(number)] = {"milestone": milestone or None, "updated_at": updated_at}
+    return prs
+
+
+def sweep_pr_milestones(state, now_iso, fetch=fetch_updated_prs):
+    """Bring every cached PR milestone up to date with GitHub by applying all PR
+    updates since the last checkpoint (or, on the first run, since the oldest
+    cached fetch, so nothing already cached can be stale). Covers every cached
+    entry, not just pending ones, since a permanent skip can be invalidated by a
+    milestone change too.
+
+    Returns the list of changes [{subject, pr_number, old, new}], or None if the
+    sweep failed (checkpoint left untouched)."""
+    meta = state["meta"]
+    since = meta.get("sweep_checkpoint")
+    by_pr = {}
+    for subject, entry in state["subjects"].items():
+        gh_info = entry.get("gh") or {}
+        if gh_info.get("pr_number") is not None:
+            by_pr.setdefault(gh_info["pr_number"], []).append((subject, entry))
+    now = parse_ts(now_iso)
+    if since is None:
+        fetched = [parse_ts(e["gh"]["fetched_at"]) for entries in by_pr.values() for _, e in entries if e["gh"].get("fetched_at")]
+        since = max(min(fetched, default=now), now - timedelta(days=PRUNE_AFTER_DAYS))
+    else:
+        since = parse_ts(since)
+
+    updated = fetch(since)
+    if updated is None:
+        return None
+
+    changes = []
+    for pr_number, info in updated.items():
+        for subject, entry in by_pr.get(pr_number, []):
+            old = entry["gh"].get("milestone")
+            if old != info["milestone"]:
+                changes.append({"subject": subject, "pr_number": pr_number, "old": old, "new": info["milestone"]})
+                entry["gh"]["milestone"] = info["milestone"]
+            entry["gh"]["fetched_at"] = now_iso
+
+    newest = max((parse_ts(i["updated_at"]) for i in updated.values()), default=now)
+    meta["sweep_checkpoint"] = (newest - SWEEP_OVERLAP).isoformat()
+    return changes
 
 
 def committer_matches(gh_info, entity, pattern):
@@ -283,6 +380,7 @@ def load_state(path):
         print(f"State file is not valid JSON: {path}\n{e}", file=sys.stderr)
         sys.exit(1)
     data.setdefault("subjects", {})
+    data.setdefault("meta", {})
     return data
 
 
@@ -302,8 +400,8 @@ def prune_state(state, target_branches):
             # it permanently with no way to re-derive it later.
             continue
         targets = entry.get("targets", {})
-        relevant = {b: targets.get(b, {}).get("status") for b in target_branches if b in targets}
-        if not relevant or not all(status in TERMINAL_STATUSES for status in relevant.values()):
+        relevant = [targets[b] for b in target_branches if b in targets]
+        if not relevant or not all(is_terminal(t, entry) for t in relevant):
             continue
         updated_at = entry.get("updated_at")
         if not updated_at:
@@ -318,13 +416,14 @@ def prune_state(state, target_branches):
         del state["subjects"][subject]
 
 
-def ci_high_water_mark(source, skip):
+def ci_high_water_mark(source, skip, ignore_jobs=()):
     if skip:
         return None, []
     script = Path(__file__).resolve().parent / "ci-status.py"
-    result = subprocess.run(
-        ["python3", str(script), "--branch", qualify(source)], capture_output=True, text=True
-    )
+    cmd = ["python3", str(script), "--branch", qualify(source)]
+    if ignore_jobs:
+        cmd += ["--ignore-jobs", ",".join(ignore_jobs)]
+    result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         print(f"Warning: ci-status.py failed, not filtering by CI coverage:\n{result.stderr.strip()}", file=sys.stderr)
         return None, []

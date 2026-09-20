@@ -11,7 +11,8 @@ high-water-mark is the oldest of the per-job frontiers, since a commit is only
 fully verified once every job has passed at or after it.
 
 Output (stdout): JSON with per-job frontier/latest-build info and the overall
-high_water_mark sha (null if it couldn't be determined for any job).
+high_water_mark sha (null if it couldn't be determined for any job). Jobs named
+in --ignore-jobs are reported (ignored: true) but don't hold the mark back.
 
 Remotes referenced by --branch (e.g. the "apache" in "apache/main") are
 fetched automatically.
@@ -178,6 +179,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--branch", default="apache/main")
     parser.add_argument("--check-sha", default=None, help="Also report whether this sha is covered by the high-water-mark")
+    parser.add_argument(
+        "--ignore-jobs", default="",
+        help="Comma-separated job names (as reported in the output, e.g. docker-nightly) to exclude "
+        "from the high-water-mark, e.g. while one is known-broken for unrelated reasons. "
+        "Ignored jobs are still reported, marked ignored.",
+    )
     args = parser.parse_args()
 
     fetch_remote_if_needed(args.branch)
@@ -191,7 +198,11 @@ def main():
     jobs = [jenkins_job_status(f"{base}-{suffix}") for base in job_bases]
     jobs.append(docker_nightly_status(bare_branch))
 
-    frontiers = [j["frontier_sha"] for j in jobs if j.get("frontier_sha")]
+    ignored = {n for n in args.ignore_jobs.split(",") if n}
+    for j in jobs:
+        j["ignored"] = j["name"] in ignored
+
+    frontiers = [j["frontier_sha"] for j in jobs if j.get("frontier_sha") and not j["ignored"]]
     high_water_mark = None
     if frontiers:
         high_water_mark = frontiers[0]

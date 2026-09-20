@@ -6,8 +6,14 @@ refresh their GitHub PR metadata, and surface the ones whose backport
 milestone is still ambiguous so a human (or the calling skill) can resolve it.
 
 "Pending" means: not yet present (by commit subject) on all --targets, and
-not marked with a terminal status (skip / backported / ported-different-
-subject) in the state file for the branches it's still missing from.
+not terminal in the state file for the branches it's still missing from
+(backported / ported-different-subject, or a permanent skip whose milestone is
+unchanged -- see is_terminal in backport_common.py).
+
+Cached PR milestones are kept current by a sweep of every GitHub PR updated
+since the last run (sweep_pr_milestones): a milestone edit on any cached PR,
+however old, is picked up, and reopens a permanent skip decided under a
+different milestone.
 
 Ambiguity has two shapes:
   - has an associated PR, but that PR carries no milestone yet
@@ -35,6 +41,19 @@ script; milestone/skip/deferred decisions are written by the caller (the
 backport-discover skill), not this script.
 
 Output (stdout): a single JSON object:
+  milestone_changes: [{subject, pr_number, old, new}, ...] cached milestones
+                       the sweep found changed since the last run
+  overdue_no_milestone : [{sha, date, author, subject, pr_number, merged_by,
+                       committer_name, committer_email}, ...] pending commits
+                       older than --missing-milestone-days that still have no
+                       milestone, from ANY committer (not scoped by
+                       --committer). Each commit is reported once: it's flagged
+                       milestone_missing_notified_at in the state file when
+                       reported (unless --no-mark-notified), and the flag clears
+                       if a milestone later appears.
+  reopened_skips   : [{subject, target, reason, decided_under, now}, ...]
+                       permanent skips invalidated by a milestone change that
+                       still requires the target
   ambiguous_pr     : [{sha, date, author, subject, pr_number, merged_by,
                        already_on, missing_from, furthest_backported_to}, ...]
   ambiguous_no_pr  : [{sha, date, author, subject, committer_name,
@@ -52,23 +71,26 @@ import argparse
 import json
 import re
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from backport_common import (
-    TERMINAL_STATUSES,
     branch_subjects,
     committer_matches,
     debase,
+    entry_milestone,
     fetch_remotes,
     gh_graphql_fetch,
+    is_terminal,
     load_state,
     parse_branch_numbers,
+    parse_ts,
     prune_state,
     qualify,
-    recently_updated_milestone_prs,
+    reopened_skips,
     save_state,
     self_committer_pattern,
     source_commits,
+    sweep_pr_milestones,
 )
 
 
@@ -89,6 +111,14 @@ def main():
         action="store_true",
         help="Don't scope to your own git identity; surface ambiguous commits from anyone.",
     )
+    parser.add_argument(
+        "--missing-milestone-days", type=int, default=5,
+        help="Report commits still without a milestone this many days after landing (default 5)",
+    )
+    parser.add_argument(
+        "--no-mark-notified", action="store_true",
+        help="Report overdue-no-milestone commits without marking them as notified (dry run)",
+    )
     parser.add_argument("--state-file", required=True)
     parser.add_argument("--refresh", action="store_true", help="Force re-fetch of cached GitHub metadata")
     args = parser.parse_args()
@@ -100,11 +130,12 @@ def main():
     fetch_remotes([qualify(args.source)] + [qualify(b) for b in target_branches])
 
     state = load_state(args.state_file)
+    now_iso = datetime.now(timezone.utc).isoformat()
+    milestone_changes = sweep_pr_milestones(state, now_iso) or []
     prune_state(state, target_branches)
 
     target_subject_sets = {b: branch_subjects(qualify(b)) for b in target_branches}
     commits = source_commits(qualify(args.source), args.since)
-    now_iso = datetime.now(timezone.utc).isoformat()
 
     effective_committer = args.committer
     if effective_committer is None and not args.all_committers:
@@ -127,8 +158,7 @@ def main():
         for b in target_branches:
             if subject in target_subject_sets[b]:
                 continue
-            status = state_targets.get(b, {}).get("status")
-            if status in TERMINAL_STATUSES:
+            if is_terminal(state_targets.get(b), entry):
                 continue
             pending.add(b)
 
@@ -144,20 +174,6 @@ def main():
         pending_entries.append((commit, subject, entry, pending))
         if args.refresh or entry.get("gh") is None:
             shas_needing_gh.append(commit["sha"])
-
-    if not args.refresh:
-        # Catch milestone drift on already-cached PRs cheaply, without a full
-        # --refresh sweep: cross-check cached milestones against a small set of
-        # recently-updated PRs per milestone line.
-        drifted = recently_updated_milestone_prs()
-        for commit, subject, entry, pending in pending_entries:
-            gh_info = entry.get("gh")
-            if not gh_info or gh_info.get("pr_number") is None:
-                continue
-            pr_number = gh_info["pr_number"]
-            if pr_number in drifted and drifted[pr_number] != gh_info.get("milestone"):
-                if commit["sha"] not in shas_needing_gh:
-                    shas_needing_gh.append(commit["sha"])
 
     if shas_needing_gh:
         gh_results = gh_graphql_fetch(shas_needing_gh)
@@ -211,9 +227,33 @@ def main():
                 "committer_email": commit["committer_email"],
             })
 
+    overdue_no_milestone = []
+    overdue_cutoff = datetime.now(timezone.utc) - timedelta(days=args.missing_milestone_days)
+    for commit, subject, entry, pending in pending_entries:
+        if entry_milestone(entry):
+            entry.pop("milestone_missing_notified_at", None)
+            continue
+        if entry.get("milestone_missing_notified_at") or parse_ts(commit["date"]) > overdue_cutoff:
+            continue
+        overdue_no_milestone.append({
+            "sha": commit["sha"],
+            "date": commit["date"],
+            "author": commit["author"],
+            "subject": subject,
+            "pr_number": entry["gh"].get("pr_number"),
+            "merged_by": entry["gh"].get("merged_by"),
+            "committer_name": commit["committer_name"],
+            "committer_email": commit["committer_email"],
+        })
+        if not args.no_mark_notified:
+            entry["milestone_missing_notified_at"] = now_iso
+
     save_state(args.state_file, state)
 
     print(json.dumps({
+        "milestone_changes": milestone_changes,
+        "reopened_skips": reopened_skips(state, target_branches),
+        "overdue_no_milestone": overdue_no_milestone,
         "ambiguous_pr": ambiguous_pr,
         "ambiguous_no_pr": ambiguous_no_pr,
         "committer_filter": effective_committer,
