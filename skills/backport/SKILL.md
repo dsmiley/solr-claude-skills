@@ -652,11 +652,15 @@ completes instead.
 
 **Phase B -- tests (crave):**
 ```bash
-crave run -- ./gradlew --console=plain test --continue
+cravex run --projectID 39 -- ./gradlew --console=plain test --continue
 ```
+`cravex` is a zsh function in `~/.zshrc` wrapping `crave` (works around the x86_64/arm64 git-shim
+problem; it injects `--projectID 39`, the Solr project, if omitted, but pass it explicitly); if the Bash tool doesn't see it, invoke via
+`zsh -ic 'cravex run --projectID 39 -- ...'`. Use `cravex` everywhere below instead of bare `crave`. Bare `crave run`
+fails with "Could not get project root/url".
 `--continue` matters: without it Gradle stops at the first module with a failing test (usually
 `:solr:core`), so the remaining modules never run and a flake there costs a whole second run just
-to find out about the others. If `crave` isn't on `$PATH`, print a one-line hint and fall back to
+to find out about the others. If `cravex` isn't available, print a one-line hint and fall back to
 asking the user how to proceed.
 
 Integration tests (the BATS suite in `solr/packaging`, what the `Solr-TestIntegration-*` Jenkins
@@ -666,8 +670,8 @@ part of `test`. Abbreviations like `itest` aren't valid Gradle task names.
 
 Crave mechanics: the build runs *remotely* -- the local CLI is just a launcher/follower, and
 the remote job keeps running even if the local command is backgrounded or killed. Get the job
-ID from `crave list` (shows "Your active jobs" plus a SUCCESSFUL/FAILED history); fetch a
-finished job's full log with `crave getlog --jobID <N>` (save to a file, it's large). Crave
+ID from `cravex list` (shows "Your active jobs" plus a SUCCESSFUL/FAILED history); fetch a
+finished job's full log with `cravex getlog --jobID <N>` (save to a file, it's large). Crave
 workers don't publish authenticated Develocity scans, so these runs are invisible to
 Develocity.
 
@@ -777,7 +781,7 @@ target's Execution pass, before moving on (T7) or to T8-T10.
 - No CI gate in Direct mode -- the caller must have already verified the commits are CI-covered.
   Triage mode's Stage 2 (`backport-selector.py`) does this itself via
   `${CLAUDE_PLUGIN_ROOT}/skills/backport-discover/scripts/ci-status.py` before anything reaches T7.
-- `crave` availability is checked in D5 phase B; if missing, the skill falls back to asking the
+- `cravex` availability is checked in D5 phase B; if missing, the skill falls back to asking the
   user how to proceed.
 - Direct mode never touches the backport-discover state file (`~/.claude/solr-backport-state.json`)
   -- only Triage mode's T7 write-back does.
