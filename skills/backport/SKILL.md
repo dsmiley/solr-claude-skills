@@ -1,6 +1,6 @@
 ---
 name: backport
-description: Backport commits from a source branch (default main) to a release branch, with LLM-assisted merge-conflict resolution and a two-phase test runner (local compile+lint, crave for tests). Two modes -- give it explicit commit hashes to cherry-pick exactly those (no CI check, caller's responsibility); give it no args to triage-and-execute (discover pending commits, resolve ambiguous milestones, select what's CI-safe, then execute) in one run. Examples - "/backport deadbeef", "/backport deadbeef cafebabe", "/backport --from branch_10x abcd1234", "/backport".
+description: Backport commits from a source branch (default main) to a release branch, with LLM-assisted merge-conflict resolution and a two-phase test runner (local compile+lint, then the full test suite on a remote runner if available, else locally). Two modes -- give it explicit commit hashes to cherry-pick exactly those (no CI check, caller's responsibility); give it no args to triage-and-execute (discover pending commits, resolve ambiguous milestones, select what's CI-safe, then execute) in one run. Examples - "/backport deadbeef", "/backport deadbeef cafebabe", "/backport --from branch_10x abcd1234", "/backport".
 user_invocable: true
 argument-hint: "[--from <source-branch>] <commit-hash> [<commit-hash> ...]  |  [--committer <pattern>] [--all-committers] [--since <duration>] [--refresh]"
 ---
@@ -650,25 +650,44 @@ a newer, not-yet-backported PR would obsolete the affected file/area entirely (e
 the file), that PR is not the one being completed -- prefer the PR whose scope the fix actually
 completes instead.
 
-**Phase B -- tests (crave):**
+**Phase B -- tests (remote runner if available, else local):**
+
+The Gradle invocation is the same either way:
 ```bash
-cravex run --projectID 39 -- ./gradlew --console=plain test --continue
+./gradlew --console=plain test --continue
 ```
-`cravex` is a zsh function in `~/.zshrc` wrapping `crave` (works around the x86_64/arm64 git-shim
-problem; it injects `--projectID 39`, the Solr project, if omitted, but pass it explicitly); if the Bash tool doesn't see it, invoke via
-`zsh -ic 'cravex run --projectID 39 -- ...'`. Use `cravex` everywhere below instead of bare `crave`. Bare `crave run`
-fails with "Could not get project root/url".
 `--continue` matters: without it Gradle stops at the first module with a failing test (usually
 `:solr:core`), so the remaining modules never run and a flake there costs a whole second run just
-to find out about the others. If `cravex` isn't available, print a one-line hint and fall back to
-asking the user how to proceed.
+to find out about the others.
+
+Pick where it runs by checking for a remote runner command -- currently only `cravex`, a
+user-provided shell function/alias or executable:
+```bash
+command -v cravex || zsh -ic 'command -v cravex'
+```
+
+- **Found** -- run remotely:
+  ```bash
+  cravex run --projectID 39 -- ./gradlew --console=plain test --continue
+  ```
+  `cravex` wraps `crave` (bare `crave run` fails with "Could not get project root/url"; 39 is the
+  Solr project). If it's a shell function the Bash tool doesn't see, invoke via
+  `zsh -ic 'cravex run --projectID 39 -- ...'`. Use `cravex` everywhere below instead of bare
+  `crave`.
+- **Not found** -- say so in one line, then `AskUserQuestion`: "No remote test runner. Run the
+  full test suite locally in the background?" Options: `Run locally in background` / `Skip tests`.
+  On `Run locally in background`, start the Gradle command above as a background Bash task with
+  output redirected to a scratchpad file, tell the user it's a long run, and carry on to D6
+  reporting tests as `running (local, background)`; when the task finishes, grep the output file
+  and report the result (and do the failure triage below). Don't run other Gradle tasks in the
+  same checkout while it runs.
 
 Integration tests (the BATS suite in `solr/packaging`, what the `Solr-TestIntegration-*` Jenkins
 job runs) are a separate Gradle task, `./gradlew integrationTests` (~15 min locally). Run it when
 the backported commits touch the CLI, `bin/solr` scripts, or packaging, or when asked; it isn't
 part of `test`. Abbreviations like `itest` aren't valid Gradle task names.
 
-Crave mechanics: the build runs *remotely* -- the local CLI is just a launcher/follower, and
+Crave mechanics (remote runs only): the build runs *remotely* -- the local CLI is just a launcher/follower, and
 the remote job keeps running even if the local command is backgrounded or killed. Get the job
 ID from `cravex list` (shows "Your active jobs" plus a SUCCESSFUL/FAILED history); fetch a
 finished job's full log with `cravex getlog --jobID <N>` (save to a file, it's large). Crave
@@ -677,15 +696,16 @@ Develocity.
 
 On test failures: **triage before treating anything as a regression.** Check each failing test
 against fleet history (solr-fucit-flaky-tests skill for fucit.org rates; solr-ci-triage skill
-for Develocity per-branch history) and note the worker's health (wall time vs. a typical run;
-suite-teardown `classMethod` timeouts are a classic contended-worker signature). Crave workers
+for Develocity per-branch history) and note the machine's health (wall time vs. a typical run;
+suite-teardown `classMethod` timeouts are a classic contended-machine signature). Crave workers
 vary widely -- an entire batch of failures can be environmental. If all failures are
 known-flaky or environment-shaped, say so and offer a re-run; only unexplained failures block.
 Leave the working tree as-is and tell the user how to inspect
 (`git status`, `./gradlew :solr:core:test --tests …` for re-running a single test locally).
 
-In the summary (D6), report tests as: `not run` / `passed (local+crave)` / `failed (phase A)` /
-`failed (phase B)`.
+In the summary (D6), report tests as: `not run` / `passed (phase A only)` /
+`passed (phase A+B, remote|local)` / `running (local, background)` / `failed (phase A)` /
+`failed (phase B, remote|local)`.
 
 ### D6. Summary
 
@@ -700,7 +720,7 @@ cafebabe  Update build deps                       skipped
 
 Then:
 - Target branch (with new local HEAD).
-- Tests: `not run` / `passed (local+crave)` / `failed (phase A: local)` / `failed (phase B: crave)`.
+- Tests: one of the D5 statuses, e.g. `passed (phase A+B, remote)` or `running (local, background)`.
 - Original branch the user was on before the skill ran, and the command to return (if D3
   stashed a dirty tree, include `git stash pop` after it):
   ```bash
@@ -781,8 +801,8 @@ target's Execution pass, before moving on (T7) or to T8-T10.
 - No CI gate in Direct mode -- the caller must have already verified the commits are CI-covered.
   Triage mode's Stage 2 (`backport-selector.py`) does this itself via
   `${CLAUDE_PLUGIN_ROOT}/skills/backport-discover/scripts/ci-status.py` before anything reaches T7.
-- `cravex` availability is checked in D5 phase B; if missing, the skill falls back to asking the
-  user how to proceed.
+- Remote-runner (`cravex`) availability is checked in D5 phase B; if missing, the skill offers to
+  run the tests locally in the background.
 - Direct mode never touches the backport-discover state file (`~/.claude/solr-backport-state.json`)
   -- only Triage mode's T7 write-back does.
 - The `backport-discover` skill runs Stages 1+2 alone (report-only, no execution) for a quick

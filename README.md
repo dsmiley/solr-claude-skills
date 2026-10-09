@@ -10,7 +10,7 @@ Not affiliated with or endorsed by the Apache Software Foundation.
 
 | Skill | What it does |
 |-------|--------------|
-| `backport` | Cherry-pick commits from `main` to a release branch with LLM-assisted conflict resolution and a two-phase test runner (local compile+lint, then crave for tests). Give it commit hashes, or no args to triage-and-execute. |
+| `backport` | Cherry-pick commits from `main` to a release branch with LLM-assisted conflict resolution and a two-phase test runner (local compile+lint, then the full test suite on a remote runner if available, else locally). Give it commit hashes, or no args to triage-and-execute. |
 | `backport-discover` | Report-only backport triage: discover pending commits, refresh GitHub PR milestone metadata, and select what's safely backportable right now (CI-gated). No execution. |
 | `solr-ci-triage` | Investigate Jenkins build failures on ci-builds.apache.org and check per-test flaky history via the Develocity API. |
 | `solr-fucit-flaky-tests` | Check a test's CI failure/flakiness trend using fucit.org's Jenkins report aggregator (history back to 2017). |
@@ -28,6 +28,9 @@ Not affiliated with or endorsed by the Apache Software Foundation.
 
 - `python3` (standard library only; no pip installs)
 - [`gh`](https://cli.github.com/) CLI, authenticated — used by `backport`, `backport-discover`
+- Optional: a `cravex` shell function/alias or executable wrapping a remote test runner
+  (`cravex run --projectID 39 -- <gradle command>`). Without it, `backport` offers to run the
+  test suite locally in the background.
 - `DEVELOCITY_ACCESS_KEY` in the environment for `solr-ci-triage` Develocity queries,
   formatted `develocity.apache.org=<key>`. Non-interactive shells don't source `~/.zshrc`,
   so the skill may `source ~/.zshrc` first.
