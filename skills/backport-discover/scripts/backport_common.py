@@ -32,29 +32,50 @@ PRUNE_AFTER_DAYS = 120
 GH_GRAPHQL_BATCH_SIZE = 50
 SWEEP_OVERLAP = timedelta(minutes=5)
 
-# The git remote name for the upstream Solr repo. Branch identifiers are bare
-# (e.g. "branch_10x") everywhere outside this module -- CLI args, state-file
-# keys, JSON output -- since this tooling only ever targets upstream and the
-# remote name is a fixed local convention, not something worth threading
-# through every call site. qualify()/debase() are the only place that
-# convention is applied, at the boundary to actual git plumbing (fetch, log,
+# Branch identifiers are bare (e.g. "branch_10x") everywhere outside this
+# module -- CLI args, state-file keys, JSON output -- since this tooling only
+# ever targets upstream. qualify()/debase() are the only place the upstream
+# remote's name is applied, at the boundary to actual git plumbing (fetch, log,
 # merge-base) which needs a real ref.
-UPSTREAM_REMOTE = "apache"
+UPSTREAM_URL_RE = re.compile(
+    r"(github\.com[:/]apache/solr|gitbox\.apache\.org/repos/asf/solr)(\.git)?/?$"
+)
+_upstream_remote = None
+
+
+def upstream_remote():
+    """Name of the git remote pointing at the upstream Solr repo, whatever the
+    user called it (apache, origin, upstream, ...)."""
+    global _upstream_remote
+    if _upstream_remote is None:
+        names = []
+        for line in git("remote", "-v").split("\n"):
+            parts = line.split()
+            if len(parts) == 3 and parts[2] == "(fetch)" and UPSTREAM_URL_RE.search(parts[1]):
+                names.append(parts[0])
+        if not names:
+            print(f"No git remote points at {REPO}; add one, e.g.\n"
+                  f"  git remote add apache https://github.com/{REPO}.git", file=sys.stderr)
+            sys.exit(1)
+        _upstream_remote = names[0]
+    return _upstream_remote
 
 
 def qualify(branch):
     """Bare branch name -> fully-qualified upstream ref, for git plumbing
     (fetch/log/merge-base) that needs a real ref to resolve. Already-qualified
     input passes through unchanged (defensive)."""
-    return branch if "/" in branch else f"{UPSTREAM_REMOTE}/{branch}"
+    return branch if "/" in branch else f"{upstream_remote()}/{branch}"
 
 
 def debase(branch):
-    """Strip a leading '<UPSTREAM_REMOTE>/' so a possibly-qualified branch
+    """Strip a leading '<upstream remote>/' so a possibly-qualified branch
     name normalizes to the bare form used as state-file keys / CLI values.
     Anything else (a bare name already, or a different remote) passes through
     unchanged."""
-    prefix = f"{UPSTREAM_REMOTE}/"
+    if "/" not in branch:
+        return branch
+    prefix = f"{upstream_remote()}/"
     return branch[len(prefix):] if branch.startswith(prefix) else branch
 
 
@@ -429,3 +450,7 @@ def ci_high_water_mark(source, skip, ignore_jobs=()):
         return None, []
     data = json.loads(result.stdout)
     return data.get("high_water_mark"), data.get("jobs", [])
+
+
+if __name__ == "__main__":
+    print(upstream_remote())

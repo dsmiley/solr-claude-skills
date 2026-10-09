@@ -27,7 +27,9 @@ Not affiliated with or endorsed by the Apache Software Foundation.
 ## Requirements
 
 - `python3` (standard library only; no pip installs)
-- [`gh`](https://cli.github.com/) CLI, authenticated — used by `backport`, `backport-discover`
+- [`gh`](https://cli.github.com/) CLI, authenticated — used by `backport`, `backport-discover`.
+  Setting PR milestones needs Solr committer rights.
+- A git remote pointing at `apache/solr`, under any name; the backport skills find it by URL.
 - Optional: a `cravex` shell function/alias or executable wrapping a remote test runner
   (`cravex run --projectID 39 -- <gradle command>`). Without it, `backport` offers to run the
   test suite locally in the background.
@@ -44,6 +46,17 @@ it once:
 ```
 echo '{}' > ~/.claude/solr-backport-state.json
 ```
+
+What's already backported is re-derived from git and PR milestones from GitHub on every run, so
+a fresh state file mostly just works. What lives *only* there are your decisions: milestones
+for commits that have no PR, permanent skips ("doesn't belong on this branch"), deferrals, and
+commits recorded as already ported under a different subject. A second machine starting from
+`{}` re-asks those. To carry them along, keep the file in a synced location and symlink it into
+`~/.claude/`.
+
+The file is per-user, not shared between committers, and triage mode proposes everyone's pending
+commits, not just yours. Coordinate so that one person drives backports to a given branch at a
+time; otherwise two people can cherry-pick the same commits before either pushes.
 
 ## License
 

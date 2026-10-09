@@ -177,7 +177,7 @@ def pick_older(a, b):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--branch", default="apache/main")
+    parser.add_argument("--branch", required=True, help="Remote-qualified branch, e.g. apache/main")
     parser.add_argument("--check-sha", default=None, help="Also report whether this sha is covered by the high-water-mark")
     parser.add_argument(
         "--ignore-jobs", default="",

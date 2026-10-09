@@ -13,6 +13,15 @@ configurable test runner.
 
 Repo root is assumed to be the current working directory and to be the Solr checkout.
 
+`<upstream>` in the git commands below is the name of the git remote pointing at `apache/solr`
+(commonly `apache`, `origin` or `upstream`). Resolve it once at the start of the run:
+
+```bash
+python3 ${CLAUDE_PLUGIN_ROOT}/skills/backport-discover/scripts/backport_common.py
+```
+
+It prints the remote's name, or fails if no remote points there -- stop and tell the user.
+
 ## Mode selection
 
 - **One or more commit hashes given** (optionally with `--from <source-branch>`) -> **Direct
@@ -48,14 +57,13 @@ Infer from the current branch (`git branch --show-current`):
 - anything else -> `AskUserQuestion` (header "Target branch", single-select, options
   `branch_10x` / `branch_9x` / "Other") to pick the target explicitly.
 
-Targets are always bare branch names (`branch_10x`, not `apache/branch_10x`) -- that's the
+Targets are always bare branch names (`branch_10x`, not `<upstream>/branch_10x`) -- that's the
 convention used consistently across the state file, `backport-discover.py`/`backport-selector.py`
-CLI args and JSON output, and this skill's own `<target>`/`apache/<target>` git-command templates
-below. The `apache` remote qualification happens only at the point of an actual git operation
-(`git fetch apache`, `git pull apache <target>`, `apache/<target>` as a ref) -- never store or
-pass around a pre-qualified value, since a stray `apache/` prefix silently breaks state-file key
-lookups in the discover/selector scripts (see the backport-subject-match-false-positives memory
-for the incident this caused).
+CLI args and JSON output, and this skill's own `<target>` git-command templates below. The
+remote qualification happens only at the point of an actual git operation (`git fetch <upstream>`,
+`git pull <upstream> <target>`, `<upstream>/<target>` as a ref) -- never store or pass around a
+pre-qualified value, since a stray remote prefix silently breaks state-file key lookups in the
+discover/selector scripts.
 
 Wrap the result as a single-element `targets` list, used everywhere T3-T10 below reference
 "target(s)". Each session backports to exactly one target branch; to backport to both 10x and
@@ -132,8 +140,7 @@ Also check the state file for other subjects sharing the same `SOLR-XXXXX` prefi
 directly (write it via the snippet below, skip the prompt) -- don't ask the user to guess a
 milestone from the commit's own subject text alone (e.g. inferring `10.x` from "since = 10.1"):
 that can contradict the ticket's real, already-established milestone and cause a premature
-"ready to resolve" in T7 for a release line that hasn't actually been backported yet (see
-[[feedback_backport_milestone_audit_before_asking]] for the incident this caused).
+"ready to resolve" in T7 for a release line that hasn't actually been backported yet.
 
 Otherwise, same shape as `ambiguous_pr`: `AskUserQuestion` (header "Milestone", options `9.x` /
 `10.x` / `11.x` / "Skip for now"), batching in groups of 4 if there are more than 4 entries. If
@@ -220,6 +227,18 @@ DATE        AUTHOR          SUBJECT
 ```
 
 If all targets are empty, say so and skip to T8.
+
+**Audit before offering.** "Not yet on the target" is decided by exact subject match, which misses
+commits that landed under a different subject: a second PR number appended (`(#3895) (#3914)`), a
+hand-written `(cherry-pick from #NNNN)` note, a retitled squash-merge, or a reimplementation under
+another JIRA key. For each candidate, grep the target's history for its JIRA key and PR number:
+
+```bash
+git log --oneline <upstream>/<target> --grep "SOLR-XXXXX" --grep "#NNNN"
+```
+
+Show any hits next to the candidate. Where a hit is clearly the same change, don't offer the
+commit: record it as `ported-different-subject` (write-back below) and say so.
 
 For each non-empty target, use `AskUserQuestion` (multiSelect, header "Backport to `<branch>`?")
 listing `<short-sha> <subject>` per commit, batching in groups of 4 if there are more than 4
@@ -335,7 +354,7 @@ using the per-target entry shapes shown there.
   ```bash
   git branch --show-current
   ```
-- Run `git fetch apache` once so subsequent steps see fresh refs.
+- Run `git fetch <upstream>` once so subsequent steps see fresh refs.
 
 ### D2. Determine target branch
 
@@ -365,7 +384,7 @@ git stash push -u -m "backport-session-wip"
 
 ```bash
 git checkout <target>
-git pull --ff-only apache <target>
+git pull --ff-only <upstream> <target>
 ```
 
 If pull fails (not fast-forward, local divergence), stop and tell the user. Do not try to
@@ -419,10 +438,10 @@ If none, treat as a hard failure: stop the skill with the error output.
 2. **Rename/content misdetection.** Git sometimes pairs an incoming file with an *unrelated*
    target file of similar content (shows as a modify/delete "directory was renamed" hint, or
    conflict markers labeled with two different file paths). Verify the incoming path actually
-   exists on the target: `git cat-file -e apache/<target>:<path>`. If it doesn't, and the
+   exists on the target: `git cat-file -e <upstream>/<target>:<path>`. If it doesn't, and the
    commit's real change to that file is irrelevant on the target (file/module never existed
    there), resolve by restoring the HEAD-side file byte-identical
-   (`git checkout apache/<target> -- <path>`) or `git rm` the orphaned incoming file --
+   (`git checkout <upstream>/<target> -- <path>`) or `git rm` the orphaned incoming file --
    don't merge the mismatched contents. But if the commit's change to that file *matters* (it
    modifies a file the target simply doesn't have yet), that's check 3's prerequisite signal, not a
    rename accident: find who added the file (below) before deciding.
@@ -432,15 +451,15 @@ If none, treat as a hard failure: stop the skill with the error output.
    by an *earlier*, not-yet-backported commit, so the target doesn't have it at all. Signs: the
    incoming side of the conflict is a whole method/field with no HEAD-side counterpart (HEAD's
    side is empty), or the hunk references a constant/method/class that doesn't exist on target --
-   confirm with `grep` or `git show apache/<target>:<path>`. If confirmed, this commit doesn't
+   confirm with `grep` or `git show <upstream>/<target>:<path>`. If confirmed, this commit doesn't
    apply to the target -- don't force it in as a merge. Also check whether the commit's (or its
    PR's) milestone implies this target line was expected (state file's `gh.milestone` /
    `milestone_override` in Triage mode, or `gh pr view <pr_number> --json milestone` otherwise); a
    milestone that requires this line despite the feature being absent is itself probably wrong.
 
    **Find the prerequisite.** Before offering to skip, identify which earlier main commit
-   introduced what's missing: for a missing file, `git log apache/main --diff-filter=A --format='%h %s'
-   -- <path>`; for a missing symbol, `git log apache/main -S'<symbol>' --format='%h %s' -- <dir>`.
+   introduced what's missing: for a missing file, `git log <upstream>/main --diff-filter=A --format='%h %s'
+   -- <path>`; for a missing symbol, `git log <upstream>/main -S'<symbol>' --format='%h %s' -- <dir>`.
    Then check whether that commit is on the target by subject, and what its own state and
    milestone are (`~/.claude/solr-backport-state.json`, or `gh pr view`). A prerequisite with no
    milestone, or one previously skipped, is the usual reason a whole chain silently never got
@@ -520,6 +539,12 @@ know which change is being discussed before reading the rest of the question.
 - On Yes: `git add -u` then `GIT_EDITOR=: git cherry-pick --continue`. (`GIT_EDITOR=:` suppresses
   the commit-message editor; `git add -u` stages only modifications to tracked files, avoiding
   accidental inclusion of pre-existing untracked files.) Record as `resolved-by-llm`.
+- If the resolution deviates from the original commit in substance (a hunk dropped or adapted to
+  the target's structure -- not merely context/import shuffling), amend the commit just created
+  to append a short, factual paragraph saying what differs and why, above any trailers:
+  `git commit --amend`. A plain cherry-pick message otherwise reads as identical to the source.
+  Only ever amend a commit created in this session and not yet pushed. The same applies when a
+  D4a / D4b / Phase A fixup squashed into a commit changes it in substance.
 - On No: fall through to the mergetool branch.
 
 **Mergetool branch:**
@@ -594,7 +619,7 @@ D5 decides whether to run tests:
 ```
 
 On failure: rule out a pre-existing failure first, using the same worktree-against-
-`apache/<target>` check as Phase A's "Pre-existing failures" guidance below (errorprone/precommit
+`<upstream>/<target>` check as Phase A's "Pre-existing failures" guidance below (errorprone/precommit
 can already be failing on the target branch independent of this backport). If it's new, trace
 which cherry-picked commit introduced it (same technique as Phase A) and squash the fix into that
 commit via `--fixup` + autosquash (same commands as Phase A). Re-run to confirm before continuing
@@ -602,12 +627,11 @@ to D5.
 
 ### D5. Tests (auto policy + two-phase runner)
 
-Decide whether to run tests:
+Phase A always runs, however cleanly the commits applied -- a clean cherry-pick doesn't guarantee
+the target branch's checks pass. Phase B (and integration tests, below) is the heavier part:
 - If any commit was `resolved-by-llm`, `resolved-by-mergetool`, or `resolved-by-lockfile-regen`
-  -> **run tests**.
-- Otherwise -> `AskUserQuestion`: "All clean -- run tests anyway?" default No.
-
-If tests are going to run, execute **two phases in order**:
+  -> **run Phase B**.
+- Otherwise -> `AskUserQuestion`: "All clean -- run the full test suite anyway?" default No.
 
 **Phase A -- local compile + lint (always local):**
 ```bash
@@ -636,7 +660,7 @@ pre-existing tip of the target branch before the backport).
 this backport -- e.g. a RAT/license-header gap, a pre-existing lint violation. Verify by
 reproducing the same check against a clean copy of the target branch's upstream tip:
 ```bash
-git worktree add <tmp-dir> apache/<target> --detach
+git worktree add <tmp-dir> <upstream>/<target> --detach
 cd <tmp-dir> && <same check command>
 cd - && git worktree remove <tmp-dir> --force
 ```
@@ -701,7 +725,9 @@ suite-teardown `classMethod` timeouts are a classic contended-machine signature)
 vary widely -- an entire batch of failures can be environmental. If all failures are
 known-flaky or environment-shaped, say so and offer a re-run; only unexplained failures block.
 Leave the working tree as-is and tell the user how to inspect
-(`git status`, `./gradlew :solr:core:test --tests …` for re-running a single test locally).
+(`git status`, `./gradlew :solr:core:test --tests …` for re-running a single test). Re-run
+individual tests locally, never through the remote runner -- its queueing overhead only pays off
+for the full suite.
 
 In the summary (D6), report tests as: `not run` / `passed (phase A only)` /
 `passed (phase A+B, remote|local)` / `running (local, background)` / `failed (phase A)` /
@@ -728,7 +754,7 @@ Then:
   ```
 - Exact push command for the user to run themselves:
   ```bash
-  git push apache <target>
+  git push <upstream> <target>
   ```
 
 D6 itself never pushes. The offer to run the push lives in D7's push gate.
@@ -738,7 +764,7 @@ In Triage mode, return to T7 after this to write results back into the state fil
 ### D7. JIRA resolution
 
 Collect the JIRA keys, then -- after the commits are pushed and the user approves -- open each in
-Firefox for the user to set its **Fix Version** and resolve.
+the user's browser for the user to set its **Fix Version** and resolve.
 
 **Direct mode:** no milestone/state tracking to check completeness against. Extract the `SOLR-\d+`
 prefix from each cherry-picked commit subject and dedupe -- treat these as candidates (some may
@@ -752,31 +778,35 @@ If the list is non-empty, proceed through the gate and approval below.
 **Push gate -- JIRA resolution must not happen before the commits are on the remote.** Check:
 
 ```bash
-git fetch apache <target> -q
-git rev-list --count apache/<target>..<target>
+git fetch <upstream> <target> -q
+git rev-list --count <upstream>/<target>..<target>
 ```
 
 - **Non-zero** (commits not pushed): `AskUserQuestion` -- "<N> commit(s) not yet on
-  `apache/<target>`. Push before JIRA resolution?" Options: `Push now` / `Already pushed -- re-check`
+  `<upstream>/<target>`. Push before JIRA resolution?" Options: `Push now` / `Already pushed -- re-check`
   / `Skip JIRA`.
-  - `Push now`: run `git push apache <target>` (its Bash approval prompt is the user's
+  - `Push now`: run `git push <upstream> <target>` (its Bash approval prompt is the user's
     confirmation). Then re-run the count -- zero continues; a push failure or still-non-zero is
     reported and D7 stops (open nothing).
-  - `Already pushed -- re-check`: re-run `git fetch apache <target> -q` + the count (covers a push
+  - `Already pushed -- re-check`: re-run `git fetch <upstream> <target> -q` + the count (covers a push
     from another terminal). Same zero / non-zero handling.
   - `Skip JIRA`: stop D7.
 - **Zero** (pushed): continue.
 
-**Approval:** once the push gate passes, `AskUserQuestion` -- "Open <N> JIRA issue(s) in Firefox
-for Fix Version / resolution?" Options: `Open` / `Skip`. For more than 5 keys, list them in the
+**Approval:** once the push gate passes, `AskUserQuestion` -- "Open <N> JIRA issue(s) in the
+browser for Fix Version / resolution?" Options: `Open` / `Skip`. For more than 5 keys, list them in the
 question detail. This approval is always required; never open browser tabs without it.
 
 **Open** (on approval): build one `https://issues.apache.org/jira/browse/<KEY>` URL per key and
-open them in a single invocation (multiple URLs -> multiple tabs):
+open them (one tab each) with the platform's opener -- `open` on macOS, `xdg-open` on Linux
+(one URL per invocation). If the user has a known browser preference, honor it (e.g.
+`open -a <Browser>`):
 
 ```bash
-open -a Firefox https://issues.apache.org/jira/browse/SOLR-1234 https://issues.apache.org/jira/browse/SOLR-5678
+open https://issues.apache.org/jira/browse/SOLR-1234 https://issues.apache.org/jira/browse/SOLR-5678
 ```
+
+If neither opener exists, print the URLs instead.
 
 Then print the reminder:
 

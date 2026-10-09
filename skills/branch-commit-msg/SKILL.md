@@ -32,7 +32,8 @@ git diff <base-branch>...HEAD -- <file>
 
 6. Synthesize a commit message that captures the *what and why* of the substantive changes. Do not list every commit — write a unified summary.  Newline after every sentence/bullet.
 
-7. Copy the message to the clipboard with a here-doc, then show it to user:
+7. Copy the message to the clipboard with a here-doc, then show it to user. `pbcopy` is macOS;
+on Linux use `wl-copy` or `xclip -selection clipboard`, and if none exists just show it:
 ```bash
 cat << 'EOF' | pbcopy
 <synthesized message>

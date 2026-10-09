@@ -63,7 +63,7 @@ Output (stdout): a single JSON object:
                       lists above, or null if unfiltered
 
 --source/--targets are bare branch names (e.g. "main", "branch_10x"); the
-upstream remote (see UPSTREAM_REMOTE in backport_common.py) is fetched
+upstream remote (see upstream_remote() in backport_common.py) is fetched
 automatically before discovery runs.
 """
 
