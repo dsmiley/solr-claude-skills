@@ -1,1 +1,4 @@
-{}
+{
+  "test_all_command": "./gradlew --console=plain test --continue",
+  "browser_command": null
+}
