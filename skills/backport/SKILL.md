@@ -253,6 +253,22 @@ git log --oneline <upstream>/<target> --grep "SOLR-XXXXX" --grep "#NNNN"
 Show any hits next to the candidate. Where a hit is clearly the same change, don't offer the
 commit: record it as `ported-different-subject` (write-back below) and say so.
 
+**Revert check.** Also look on the source branch for a later revert of each candidate (the
+subject-match above can't see it), and for candidates that are themselves reverts:
+
+```bash
+git log --oneline <upstream>/<source> --grep 'Revert ".*#NNNN' --grep "This reverts commit <sha>"
+```
+
+Advise per case, shown next to the candidate:
+- **Candidate and its revert are both pending:** recommend skipping both (`not-applicable`,
+  reason "reverted on main").
+- **Candidate already backported, its revert pending:** flag it prominently and recommend
+  backporting the revert -- the original is live on the target and was likely a mistake.
+- **Candidate is a revert whose original isn't on the target:** recommend skipping it.
+
+Never offer an original as a plain candidate while an un-backported revert of it exists.
+
 For each non-empty target, use `AskUserQuestion` (multiSelect, header "Backport to `<branch>`?")
 listing `<short-sha> <subject>` per commit, batching in groups of 4 if there are more than 4
 candidates. If the user dismisses without answering, stop and wait for direction rather than
